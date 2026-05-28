@@ -240,10 +240,21 @@ QJ85ioEpy00NioqcF0WyMZH80uMsPycfpnl5uF7RkW8u
 		},
 	}
 
+	// Secret in a different namespace, used to test namespace isolation
+	clientSecretOtherNS := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "foo", Namespace: "other-namespace"},
+		Data: map[string][]byte{
+			userNameKey: []byte(userNameValue),
+			passwordKey: []byte(passwordValue),
+		},
+	}
+
 	tests := map[string]struct {
-		store    esv1.GenericStore          // leave nil for namespaced store
-		provider *esv1.SecretServerProvider // discarded when store is set
-		kube     kubeClient.Client
+		store       esv1.GenericStore          // leave nil for namespaced store in "default" namespace
+		provider    *esv1.SecretServerProvider // discarded when store is set
+		kube        kubeClient.Client
+		esNamespace string
+
 		errCheck func(t *testing.T, err error)
 	}{
 		"missing provider config": {
@@ -363,6 +374,51 @@ QJ85ioEpy00NioqcF0WyMZH80uMsPycfpnl5uF7RkW8u
 			},
 			kube: clientfake.NewClientBuilder().WithObjects(clientSecret, clientSecretWithDomain).Build(),
 		},
+		"namespace mismatch: store in default, ES in other-namespace": {
+			store: &esv1.SecretStore{
+				TypeMeta:   metav1.TypeMeta{Kind: esv1.SecretStoreKind},
+				ObjectMeta: metav1.ObjectMeta{Name: "my-store", Namespace: "default"},
+				Spec: esv1.SecretStoreSpec{
+					Provider: &esv1.SecretStoreProvider{
+						SecretServer: validProvider,
+					},
+				},
+			},
+			kube:        clientfake.NewClientBuilder().WithObjects(clientSecret).Build(),
+			esNamespace: "other-namespace",
+			errCheck: func(t *testing.T, err error) {
+				assert.ErrorIs(t, err, errNamespaceMismatch)
+			},
+		},
+		"namespace match: store and ES in other-namespace": {
+			store: &esv1.SecretStore{
+				TypeMeta:   metav1.TypeMeta{Kind: esv1.SecretStoreKind},
+				ObjectMeta: metav1.ObjectMeta{Name: "my-store", Namespace: "other-namespace"},
+				Spec: esv1.SecretStoreSpec{
+					Provider: &esv1.SecretStoreProvider{
+						SecretServer: &esv1.SecretServerProvider{
+							Username:  makeSecretRefUsingRef(clientSecretOtherNS.Name, userNameKey),
+							Password:  makeSecretRefUsingRef(clientSecretOtherNS.Name, passwordKey),
+							ServerURL: validProvider.ServerURL,
+						},
+					},
+				},
+			},
+			kube:        clientfake.NewClientBuilder().WithObjects(clientSecretOtherNS).Build(),
+			esNamespace: "other-namespace",
+		},
+		"no namespace mismatch when store namespace is empty": {
+			store: &esv1.SecretStore{
+				TypeMeta: metav1.TypeMeta{Kind: esv1.SecretStoreKind},
+				Spec: esv1.SecretStoreSpec{
+					Provider: &esv1.SecretStoreProvider{
+						SecretServer: validProvider,
+					},
+				},
+			},
+			kube: clientfake.NewClientBuilder().WithObjects(clientSecret).Build(),
+		},
+
 		"valid with CABundle and CAProvider using Secret": {
 			provider: &esv1.SecretServerProvider{
 				Username:  validProvider.Username,
@@ -489,7 +545,8 @@ QJ85ioEpy00NioqcF0WyMZH80uMsPycfpnl5uF7RkW8u
 			store := tc.store
 			if store == nil {
 				store = &esv1.SecretStore{
-					TypeMeta: metav1.TypeMeta{Kind: esv1.SecretStoreKind},
+					TypeMeta:   metav1.TypeMeta{Kind: esv1.SecretStoreKind},
+					ObjectMeta: metav1.ObjectMeta{Namespace: clientSecret.Namespace},
 					Spec: esv1.SecretStoreSpec{
 						Provider: &esv1.SecretStoreProvider{
 							SecretServer: tc.provider,
@@ -497,7 +554,12 @@ QJ85ioEpy00NioqcF0WyMZH80uMsPycfpnl5uF7RkW8u
 					},
 				}
 			}
-			sc, err := p.NewClient(context.Background(), store, tc.kube, clientSecret.Namespace)
+
+			esNamespace := tc.esNamespace
+			if esNamespace == "" {
+				esNamespace = clientSecret.Namespace
+			}
+			sc, err := p.NewClient(context.Background(), store, tc.kube, esNamespace)
 			if tc.errCheck == nil {
 				assert.NoError(t, err)
 				delineaClient, ok := sc.(*client)

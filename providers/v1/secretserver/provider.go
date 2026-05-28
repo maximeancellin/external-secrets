@@ -41,6 +41,7 @@ var (
 	errInvalidSpec                   = errors.New("invalid specification for secret server provider")
 	errClusterStoreRequiresNamespace = errors.New("when using a ClusterSecretStore, namespaces must be explicitly set")
 	errMissingSecretName             = errors.New("must specify a secret name")
+	errNamespaceMismatch             = errors.New("secretstore namespace does not match the ExternalSecret namespace")
 
 	errMissingSecretKey = errors.New("must specify a secret key")
 )
@@ -61,15 +62,36 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 	if err != nil {
 		return nil, err
 	}
+
+	// For namespaced SecretStores (not ClusterSecretStore), enforce that the store
+	// belongs to the same namespace as the ExternalSecret. Without this check, the
+	// controller may resolve a SecretStore from namespace B and use it for an
+	// ExternalSecret in namespace A, breaking per-namespace isolation.
+	if store.GetKind() != esv1.ClusterSecretStoreKind {
+		storeNamespace := store.GetNamespace()
+		if storeNamespace != "" && storeNamespace != namespace {
+			return nil, errNamespaceMismatch
+		}
+	}
+
 	if store.GetKind() == esv1.ClusterSecretStoreKind && doesConfigDependOnNamespace(cfg) {
 		// we are not attached to a specific namespace, but some config values are dependent on it
 		return nil, errClusterStoreRequiresNamespace
 	}
-	username, err := loadConfigSecret(ctx, store.GetKind(), cfg.Username, kube, namespace)
+
+	// For namespaced SecretStores, always use the store's own namespace to resolve
+	// credential Secrets — not the namespace parameter which comes from the ExternalSecret.
+	// This guarantees that each namespace's SecretStore reads its own credentials.
+	credentialNamespace := namespace
+	if store.GetKind() != esv1.ClusterSecretStoreKind && store.GetNamespace() != "" {
+		credentialNamespace = store.GetNamespace()
+	}
+
+	username, err := loadConfigSecret(ctx, store.GetKind(), cfg.Username, kube, credentialNamespace)
 	if err != nil {
 		return nil, err
 	}
-	password, err := loadConfigSecret(ctx, store.GetKind(), cfg.Password, kube, namespace)
+	password, err := loadConfigSecret(ctx, store.GetKind(), cfg.Password, kube, credentialNamespace)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +109,7 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 		cert, err := esutils.FetchCACertFromSource(ctx, esutils.CreateCertOpts{
 			StoreKind:  store.GetKind(),
 			Client:     kube,
-			Namespace:  namespace,
+			Namespace:  credentialNamespace,
 			CABundle:   cfg.CABundle,
 			CAProvider: cfg.CAProvider,
 		})
